@@ -22,4 +22,4 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt 
 COPY . .
 
 # 6. Flask 앱을 실행합니다.
-CMD ["python", "improved-coaching-app.py"]
+CMD ["python", "app.py"]
