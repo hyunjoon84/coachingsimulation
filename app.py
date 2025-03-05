@@ -10,9 +10,11 @@ from flask import Flask, request, jsonify, render_template, session as flask_ses
 from dotenv import load_dotenv
 import speech_recognition as sr
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, UTC  # Added UTC for deprecation fix
+from datetime import datetime, timezone
 from io import BytesIO
 import smartsheet
+
+UTC = timezone.utc
 
 # Load .env
 load_dotenv()
