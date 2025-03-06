@@ -545,6 +545,7 @@
             const reader = new FileReader();
             reader.addEventListener('load', async () => {
                 const base64Audio = reader.result;
+                console.log('Audio size:', audioBlob.size, 'Base64 length:', base64Audio.length);
                 await sendResponse(base64Audio);
             });
             reader.readAsDataURL(audioBlob);

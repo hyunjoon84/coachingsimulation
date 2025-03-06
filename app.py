@@ -123,24 +123,30 @@ def generate_speech(text):
     return data_uri
 
 def transcribe_audio(base64_audio):
-    """Transcribe audio using speech recognition."""
     try:
         audio_bytes = base64.b64decode(base64_audio.split(',')[1])
-        webm_filename = f"temp_{uuid.uuid4()}.webm"
-        wav_filename = f"temp_{uuid.uuid4()}.wav"
+        webm_filename = f"/tmp/temp_{uuid.uuid4()}.webm"
+        wav_filename = f"/tmp/temp_{uuid.uuid4()}.wav"
         with open(webm_filename, 'wb') as f:
             f.write(audio_bytes)
+        print(f"WebM file saved: {webm_filename}, size: {os.path.getsize(webm_filename)} bytes")
         if not convert_to_wav(webm_filename, wav_filename):
+            print("Conversion to WAV failed")
             return "Could not process audio. Please try again."
+        print(f"WAV file saved: {wav_filename}, size: {os.path.getsize(wav_filename)} bytes")
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_filename) as source:
             audio = recognizer.record(source)
             try:
                 text = recognizer.recognize_google(audio)
-            except:
+                print("Google recognition succeeded:", text)
+            except sr.UnknownValueError:
+                print("Google could not understand audio") 
                 try:
                     text = recognizer.recognize_sphinx(audio)
-                except:
+                    print("Sphinx recognition succeeded:", text)
+                except sr.UnknownValueError:
+                    print("Sphinx could not understand audio")
                     text = "Could not understand audio. Please try again."
         try:
             os.remove(webm_filename)
@@ -810,6 +816,16 @@ def get_session_details(session_id):
     }
     return jsonify(result)
 
+@app.route("/api/ffmpeg-test", methods=["GET"])
+def ffmpeg_test():
+    try:
+        result = subprocess.run([FFMPEG_PATH, "-version"], capture_output=True, text=True, check=True)
+        print(f"FFmpeg version: {result.stdout}")
+        return jsonify({"ffmpeg_version": result.stdout})
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg error: {e.stderr}")
+        return jsonify({"error": str(e.stderr)}), 500
+    
 if __name__ == "__main__":
     os.makedirs("static/audio", exist_ok=True)
     port = int(os.environ.get("PORT", 5000))
