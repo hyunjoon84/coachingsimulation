@@ -1,4 +1,7 @@
 import os
+import asyncio
+import aiohttp
+import platform
 import uuid
 import base64
 import subprocess
@@ -15,6 +18,11 @@ from io import BytesIO
 import smartsheet
 
 UTC = timezone.utc
+
+if platform.system() == 'Windows':
+    FFMPEG_PATH = 'C:/ffmpeg/bin/ffmpeg.exe'
+else:
+    FFMPEG_PATH = os.getenv('FFMPEG_PATH', '/usr/bin/ffmpeg')
 
 # Load .env
 load_dotenv()
@@ -123,16 +131,22 @@ def generate_speech(text):
     return data_uri
 
 def transcribe_audio(base64_audio):
+    tmp_dir = "/tmp"
+    os.makedirs(tmp_dir, exist_ok=True)  # /tmp 디렉토리 존재 확인
+    webm_filename = os.path.join(tmp_dir, f"temp_{uuid.uuid4()}.webm")
+    wav_filename = os.path.join(tmp_dir, f"temp_{uuid.uuid4()}.wav")
     try:
+        if ',' not in base64_audio:
+            return "Audio conversion failed. Please check your audio input and try again."
         audio_bytes = base64.b64decode(base64_audio.split(',')[1])
-        webm_filename = f"/tmp/temp_{uuid.uuid4()}.webm"
-        wav_filename = f"/tmp/temp_{uuid.uuid4()}.wav"
         with open(webm_filename, 'wb') as f:
             f.write(audio_bytes)
+        # 파일이 제대로 생성되었는지 체크
+        if not os.path.exists(webm_filename) or os.path.getsize(webm_filename) == 0:
+            return "Audio conversion failed. The audio file was not saved correctly."
         print(f"WebM file saved: {webm_filename}, size: {os.path.getsize(webm_filename)} bytes")
         if not convert_to_wav(webm_filename, wav_filename):
-            print("Conversion to WAV failed")
-            return "Could not process audio. Please try again."
+            return "Audio conversion failed. Please check your audio input and try again."
         print(f"WAV file saved: {wav_filename}, size: {os.path.getsize(wav_filename)} bytes")
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_filename) as source:
@@ -140,23 +154,28 @@ def transcribe_audio(base64_audio):
             try:
                 text = recognizer.recognize_google(audio)
                 print("Google recognition succeeded:", text)
+                return text
             except sr.UnknownValueError:
-                print("Google could not understand audio") 
+                print("Google could not understand audio")
                 try:
                     text = recognizer.recognize_sphinx(audio)
                     print("Sphinx recognition succeeded:", text)
+                    return text
                 except sr.UnknownValueError:
                     print("Sphinx could not understand audio")
-                    text = "Could not understand audio. Please try again."
-        try:
-            os.remove(webm_filename)
-            os.remove(wav_filename)
-        except:
-            pass
-        return text
+                    return "Could not understand audio. Please speak clearly and try again."
     except Exception as e:
         print(f"Error transcribing audio: {e}")
-        return "Error processing audio. Please try again."
+        return f"Error processing audio: {str(e)}. Please try again."
+    finally:
+        for file in (webm_filename, wav_filename):
+            if os.path.exists(file):
+                try:
+                    os.remove(file)
+                    print(f"Deleted {file}")
+                except Exception as e:
+                    print(f"Failed to delete {file}: {e}")
+
 
 #######################################################
 # OpenAI API Functions
@@ -299,6 +318,7 @@ def generate_employee_response(session_id, coach_text, current_step):
         "role": "system",
         "content": f"""
 You are an employee participating in a coaching session. Respond naturally and in-character to the coach's latest message, considering the current step: {current_step}.
+You don't need to be overly formal or coach-like; instead, keep your response straightforward and constructive. If the coach's message seems to stray, briefly acknowledge it but steer the conversation back to practical solutions. 
 Return ONLY a string representing your reply, no JSON or additional structure.
 """
     }
@@ -330,7 +350,10 @@ def generate_supervisor_response(session_id, coach_text, current_step):
         "content": f"""
 You are the coach's supervisor with full knowledge of the coaching guidelines from the content_summary document. Your task is to:
 1. Analyze the entire conversation history and the coach's latest message to determine the current coaching step from these options: {', '.join(COACHING_STEPS)}.
-2. Evaluate the coach's performance in that step, providing feedback and noting if the transition to the next step is premature or incomplete.
+2. Evaluate the coach's performance in the current coaching process. Provide detailed, concrete feedback strictly based on the benchmarks and criteria outlined in the content_summary.txt document. If you observe that the coach's transition to the next step is premature or incomplete, note this explicitly.
+3. Evaluate the coach's skills by referencing specific guidelines from the content_summary.txt document. Do not offer generic compliments; instead, provide observations that are directly tied to the active listening techniques, questioning strategies, and other benchmarks detailed in the document.
+4. Where applicable, reference specific coaching questions or guidelines from the content_summary.txt to ensure that your feedback is deeply contextual and aligned with the established standards.
+
 
 The coaching steps are:
 - center_together: Help the coachee clear their mind and focus.
@@ -340,14 +363,40 @@ The coaching steps are:
 - gain_commitment: Ensure the coachee is motivated to follow the plan.
 - assess_progress: Discuss tracking progress and follow-up.
 
+*Coaching Questions (for context):
+1. Center Together:
+  • How would you like to center?
+  • What does centering look like to you?
+  • How ready are you feeling after centering?
+2. Clarify the Focus:
+  • What is the key problem or challenge for you?
+  • What is significant about this for you right now?
+  • How does this relate to other issues you are facing?
+3. Identify the Goal:
+  • What outcomes would be ideal here?
+  • What impact do you want to have?
+  • How will you know you have been successful?
+4. Develop an Action Plan:
+  • What is a specific action you can take toward this?
+  • What might be the first step?
+  • What support do you need?
+5. Gain Commitment:
+  • How committed are you to taking these steps on a scale of 1 to 10?
+  • What might prevent you from taking these steps?
+6. Assess Progress:
+  • How will you assess your progress toward your goal(s)?
+  • How can I better support you in achieving your goal?
+  • How helpful was this conversation for you?
+
 Return ONLY valid JSON with one top-level key: "feedback", containing:
 - "current_step": The detected step (string).
 - "Coaching_Process": {{
-    "comments": [array of strings with observations or suggestions about the process],
-    "step_complete": Boolean (true if the current step is adequately addressed, false if premature or incomplete)
+    "comments": [an array of strings containing your observations and suggestions about the coaching process, with each comment directly tied to specific guidelines from content_summary.txt],
+    "step_complete": "complete" | "premature" | "partial" | "incomplete"
+      // You can expand or rename these values as needed
   }}
 - "Coaching_Skills": {{
-    "comments": [array of strings with feedback on the coach’s skills]
+    "comments": [array of strings with feedback on the coach’s skills based strictly on content_summary guidelines]
   }}
 
 Example:
@@ -356,10 +405,16 @@ Example:
     "current_step": "clarify_focus",
     "Coaching_Process": {{
       "comments": ["The coach asked about the issue but didn’t fully clarify it.", "More probing needed before moving to goals."],
-      "step_complete": false
+      "step_complete":  "premature"
+       /* Possible values:
+         - "complete": The step was fully addressed
+         - "premature": Moving on too soon (the step still needs more exploration)
+         - "partial": Some progress was made, but it's not fully complete
+         - "incomplete": The step was barely addressed or not addressed at all
+      */     
     }},
     "Coaching_Skills": {{
-      "comments": ["Good use of empathy.", "More open-ended questions could help."]
+      "comments": ["The coach did not sufficiently reference the active listening techniques described in the content_summary.", "The response lacks specific alignment with the established coaching benchmarks."]
     }}
   }}
 }}
@@ -397,7 +452,7 @@ Latest coach message: '{coach_text}'
         feedback_list = [
             f"Current Step: {feedback_dict['current_step']}",
             f"Coaching Process (Complete: {feedback_dict['Coaching_Process']['step_complete']}): {', '.join(feedback_dict['Coaching_Process']['comments'])}",
-            f"Coaching Skills: {', '.join(feedback_dict['Coaching_Skills']['comments'])}"  # Fixed typo 'f.feedback_dict'
+            f"Coaching Skills: {', '.join(feedback_dict['Coaching_Skills']['comments'])}"
         ]
         return feedback_list, feedback_dict["current_step"]
     
@@ -490,35 +545,46 @@ def generate_final_evaluation(session_id):
             "strengths": ["No significant coaching interaction occurred."],
             "areas_of_improvement": ["Coach needs to engage more actively in the session."]
         }
+    
+    # 어떤 단계가 다뤄졌는지 확인
+    covered_steps = set()
+    for msg in messages:
+        if msg.step and msg.step in COACHING_STEPS:
+            covered_steps.add(msg.step)
+    
+    missing_steps = [step for step in COACHING_STEPS if step not in covered_steps]
+    
     conversation_text = ""
     for msg in messages:
         if msg.role == "coach":
             conversation_text += f"Coach: {msg.content}\n"
         else:
             conversation_text += f"Employee: {msg.content}\n"
+            
     system_message = {
         "role": "system",
-        "content": """
-You are an expert coach evaluator. Analyze the coaching conversation, focusing exclusively on the coach's performance.
-Evaluate how effectively the coach demonstrated the coaching process and coaching skills, based solely on the criteria in the content_summary document.
+        "content": f"""
+You are an expert coach evaluator. Focus on these instructions:
+1. Check if all required coaching steps were addressed. The required steps are: {', '.join(COACHING_STEPS)}
+2. Based on the conversation analysis, the following steps were MISSING: {', '.join(missing_steps) if missing_steps else 'None'}
+3. You MUST deduct 10 points for each missing coaching step. For {len(missing_steps)} missing steps, deduct {len(missing_steps) * 10} points.
+4. You MUST mention each missing step in the "areas_of_improvement" array.
+5. Evaluate coach's skills: listening, questioning, empathy, clarity, relevance based on content_summary.txt.
+6. Give a numeric score 0-100, accounting for the mandatory deductions for missing steps. Then assign A-F grade.
+7. Provide an array "strengths" (3-5 items) and "areas_of_improvement" (at least {len(missing_steps)} items for missing steps, plus 1-2 other areas if needed).
 
-You MUST output valid JSON only, with exactly two keys: "reply" (a string) and "feedback" (an array of strings).
-
-Provide a detailed evaluation that includes:
-- An overall percentage score (0-100)
-- A letter grade (A-F)
-- 3-5 key strengths
-- 2-3 focused areas for improvement
+You MUST Return JSON with keys: "percentage", "grade", "strengths", "areas_of_improvement" (all arrays except grade is string, percentage is number).
 
 Format your response as JSON:
-{
+{{
   "percentage": 85,
   "grade": "B",
   "strengths": ["Strength 1", "Strength 2", "Strength 3"],
-  "areas_of_improvement": ["Area 1", "Area 2"]
-}
+  "areas_of_improvement": ["Did not complete step X", "Did not address step Y", "Area 3"]
+}}
 """
     }
+    
     user_message = {
         "role": "user",
         "content": f"""
@@ -527,30 +593,161 @@ Here is the complete coaching conversation to evaluate:
 {conversation_text}
 
 Please provide a final evaluation as specified.
+Remember, the following coaching steps were MISSING: {', '.join(missing_steps) if missing_steps else 'None'}
+You MUST deduct 10 points for each missing step ({len(missing_steps) * 10} points total) and include each missing step in the areas_of_improvement.
 """
     }
+    
     response = call_openai_api([system_message, user_message], temperature=0.3, max_tokens=1000)
+
+    def normalize_text(txt: str) -> str:
+        # Lowercase, replace underscores with spaces, remove punctuation
+        txt = txt.lower().replace("_", " ")
+        # optionally remove punctuation (commas, periods, etc.)
+        txt = re.sub(r"[^\w\s]", "", txt)
+        return txt
+        
     try:
         parsed = json.loads(response)
+        
+        # 누락된 단계가 있는데 개선 영역에 누락된 단계가 포함되어 있지 않으면 강제로 추가
+        if missing_steps:
+             # Ensure the 'areas_of_improvement' field exists
+            if "areas_of_improvement" not in parsed or not parsed["areas_of_improvement"]:
+                parsed["areas_of_improvement"] = []
+             # -- 1) Build a set of step names that GPT might have already mentioned in some form --
+            gpt_improvement_set = set()
+            for item in parsed["areas_of_improvement"]:
+            # Look for any missing step name in the text of the item
+                normalized_item = normalize_text(item)
+                for step_name in missing_steps:
+                    normalized_step = normalize_text(step_name)
+                    # For example, if item = "Did not address step: develop_action_plan" 
+                    # and step_name = "develop_action_plan", we'll detect it
+                    if normalized_step in normalized_item:
+                        gpt_improvement_set.add(step_name)
+
+            # -- 2) Only add the forced line if GPT did NOT already mention that step --
+            for step in missing_steps:
+                if step not in gpt_improvement_set:
+                    improvement_text = f"Did not complete the '{step}' coaching step"
+                    # This final check ensures we don't double-append if the exact text already exists
+                    if improvement_text not in parsed["areas_of_improvement"]:
+                        parsed["areas_of_improvement"].append(improvement_text)
+            
+            # 점수 강제 조정 (누락된 단계당 10점 차감)
+            if "percentage" in parsed:
+                max_score = 100
+                deduction = len(missing_steps) * 10
+                parsed["percentage"] = max(0, min(max_score - deduction, parsed["percentage"]))
+                
+                # 등급 업데이트
+                if parsed["percentage"] >= 90:
+                    parsed["grade"] = "A"
+                elif parsed["percentage"] >= 80:
+                    parsed["grade"] = "B"
+                elif parsed["percentage"] >= 70:
+                    parsed["grade"] = "C"
+                elif parsed["percentage"] >= 60:
+                    parsed["grade"] = "D"
+                else:
+                    parsed["grade"] = "F"
+        
     except:
         try:
             json_match = re.search(r'\{.*"percentage".*"grade".*"strengths".*"areas_of_improvement".*\}', response, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group(0))
+                
+                # 여기서도 누락된 단계 확인 및 강제 추가
+                if missing_steps:
+                    if "areas_of_improvement" not in parsed or not parsed["areas_of_improvement"]:
+                        parsed["areas_of_improvement"] = []
+                    
+                    existing_improvements = set(parsed["areas_of_improvement"])
+                    for step in missing_steps:
+                        improvement_text = f"Did not complete the '{step}' coaching step"
+                        if improvement_text not in existing_improvements:
+                            parsed["areas_of_improvement"].append(improvement_text)
+                    
+                    # 점수 강제 조정
+                    if "percentage" in parsed:
+                        max_score = 100
+                        deduction = len(missing_steps) * 10
+                        parsed["percentage"] = max(0, min(max_score - deduction, parsed["percentage"]))
+                        
+                        # 등급 업데이트
+                        if parsed["percentage"] >= 90:
+                            parsed["grade"] = "A"
+                        elif parsed["percentage"] >= 80:
+                            parsed["grade"] = "B"
+                        elif parsed["percentage"] >= 70:
+                            parsed["grade"] = "C"
+                        elif parsed["percentage"] >= 60:
+                            parsed["grade"] = "D"
+                        else:
+                            parsed["grade"] = "F"
             else:
-                return {
-                    "percentage": 70,
-                    "grade": "C",
+                # 기본 응답 생성 (누락된 단계 반영)
+                deduction = len(missing_steps) * 10
+                percentage = max(0, 70 - deduction)  # 기본 70점에서 차감
+                
+                # 등급 계산
+                if percentage >= 90:
+                    grade = "A"
+                elif percentage >= 80:
+                    grade = "B"
+                elif percentage >= 70:
+                    grade = "C"
+                elif percentage >= 60:
+                    grade = "D"
+                else:
+                    grade = "F"
+                
+                areas_of_improvement = []
+                for step in missing_steps:
+                    areas_of_improvement.append(f"Did not complete the '{step}' coaching step")
+                
+                if not areas_of_improvement:
+                    areas_of_improvement = ["Structure coaching process better", "Ask more open-ended questions"]
+                
+                parsed = {
+                    "percentage": percentage,
+                    "grade": grade,
                     "strengths": ["Communication skills", "Building rapport"],
-                    "areas_of_improvement": ["Structure coaching process better", "Ask more open-ended questions"]
+                    "areas_of_improvement": areas_of_improvement
                 }
         except:
-            return {
-                "percentage": 70,
-                "grade": "C",
+            # 가장 기본적인 응답 (누락된 단계 반영)
+            deduction = len(missing_steps) * 10
+            percentage = max(0, 70 - deduction)  # 기본 70점에서 차감
+            
+            # 등급 계산
+            if percentage >= 90:
+                grade = "A"
+            elif percentage >= 80:
+                grade = "B"
+            elif percentage >= 70:
+                grade = "C"
+            elif percentage >= 60:
+                grade = "D"
+            else:
+                grade = "F"
+            
+            areas_of_improvement = []
+            for step in missing_steps:
+                areas_of_improvement.append(f"Did not complete the '{step}' coaching step")
+            
+            if not areas_of_improvement:
+                areas_of_improvement = ["Structure coaching process better", "Ask more open-ended questions"]
+            
+            parsed = {
+                "percentage": percentage,
+                "grade": grade,
                 "strengths": ["Communication skills", "Building rapport"],
-                "areas_of_improvement": ["Structure coaching process better", "Ask more open-ended questions"]
+                "areas_of_improvement": areas_of_improvement
             }
+    
     return parsed
 
 #######################################################
@@ -587,7 +784,7 @@ def save_session_to_smartsheet(session_id):
     smartsheet_client = smartsheet.Smartsheet(SMARTSHEET_API_KEY)
     smartsheet_client.errors_as_exceptions(True)
     new_row = smartsheet.models.Row()
-    new_row.to_bottom = True
+    new_row.to_top = True
     cell0 = smartsheet.models.Cell()
     cell0.column_id = get_column_id("ID")
     cell0.value = session_obj.id
@@ -685,11 +882,13 @@ def respond():
         user_text = transcribe_audio(audio_data)
     else:
         user_text = text.strip()
-    if not user_text or user_text == "Could not understand audio. Please try again.":
+    # 수정: 음성 인식 실패 혹은 에러 발생 시 텍스트 입력 허용 플래그 추가
+    if not user_text or "Could not understand audio" in user_text or "Error processing audio" in user_text:
         return jsonify({
-            "error": "Could not understand audio", 
-            "text": "I couldn't hear you clearly. Could you please repeat that?",
-            "audio": generate_speech("I couldn't hear you clearly. Could you please repeat that?")
+            "error": user_text,
+            "text": "I couldn't hear you clearly. Please try again or type your response.",
+            "audio": generate_speech("I couldn't hear you clearly. Please try again or type your response."),
+            "allow_text_input": True
         }), 200
     last_message = ConversationMessage.query.filter_by(session_id=session_id).order_by(ConversationMessage.timestamp.desc()).first()
     current_step = last_message.step if last_message else "center_together"

@@ -12,3 +12,4 @@ SQLAlchemy==1.4.46
 requests==2.28.2
 transformers==4.21.3
 smartsheet_python_sdk==3.0.4
+pocketsphinx==0.1.15
